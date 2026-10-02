@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import math
+import hmac
 import threading
 import time
 import gc
@@ -300,6 +301,17 @@ input, select, textarea {
     transform: translateY(-1px) !important;
 }
 
+/* ── Login form button ── */
+[data-testid="stFormSubmitButton"] button {
+    background: linear-gradient(135deg, #2563EB, #1D4ED8) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+}
+[data-testid="stFormSubmitButton"] button p { color: #fff !important; }
+
 /* ── Save button (green) ── */
 .save-wrap .stButton > button[kind="primary"] {
     background: linear-gradient(135deg, #059669, #047857) !important;
@@ -415,6 +427,25 @@ st.markdown("""
     <span class="hero-badge">AI Powered</span>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Password gate ────────────────────────────────────────────
+if not st.session_state.get("authenticated"):
+    app_password = st.secrets.get("APP_PASSWORD", "")
+    if not app_password:
+        st.error("ยังไม่ได้ตั้งรหัสผ่านของแอป — ผู้ดูแลต้องเพิ่ม APP_PASSWORD ใน Streamlit secrets ก่อน")
+        st.stop()
+
+    with st.form("login_form"):
+        entered = st.text_input("รหัสผ่าน", type="password")
+        submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
+
+    if submitted:
+        if hmac.compare_digest(entered.encode(), app_password.encode()):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        time.sleep(1)  # slows down password guessing
+        st.error("รหัสผ่านไม่ถูกต้อง")
+    st.stop()
 
 try:
     with open('item_master.json', 'r', encoding='utf-8') as f:
