@@ -13,13 +13,20 @@ from google.oauth2.service_account import Credentials
 import datetime
 
 # --- CONFIG ---
-BRANCH_CONFIG = {
+BRANCH_TAB = "ตั้งค่า_สาขา"
+MENU_TAB = "ตั้งค่า_เมนู"
+BRANCH_HEADER = ["VID", "สาขา"]
+MENU_HEADER = ["สาขา", "รหัสสินค้า", "ชื่อเมนู", "ราคา"]
+
+# Only used to fill the two config tabs the first time they are created.
+SEED_BRANCHES = {
     "208413": "อโศก",
     "205711": "พระราม 3",
     "206025": "แฟชั่น 3",
     "207033": "แฟชั่น B",
     "990221": "เอสพลานาด"
 }
+SEED_MENU_FILE = "item_master.json"
 
 CSV_CONFIG = {
     "date_col": "วันที่เปิดบิล",
@@ -35,8 +42,79 @@ def get_gspread_client():
     creds = Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return gspread.authorize(creds)
 
+def get_spreadsheet():
+    return get_gspread_client().open_by_key(st.secrets["SHEET_ID"])
+
 def get_google_sheet():
-    return get_gspread_client().open_by_key(st.secrets["SHEET_ID"]).worksheet("Data")
+    return get_spreadsheet().worksheet("Data")
+
+@st.cache_resource
+def get_seed_lock():
+    return threading.Lock()
+
+def get_or_create_tab(spreadsheet, title, header, seed_rows):
+    with get_seed_lock():
+        try:
+            return spreadsheet.worksheet(title)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title=title, rows=max(len(seed_rows) + 50, 100), cols=len(header))
+            ws.update([header] + seed_rows, value_input_option="RAW")
+            return ws
+
+def seed_menu_rows():
+    with open(SEED_MENU_FILE, "r", encoding="utf-8") as f:
+        items = json.load(f)
+    return [[branch, item["code"], item["name"], item["price"]]
+            for branch, branch_items in items.items()
+            for item in branch_items.values()]
+
+def parse_price(raw):
+    return float(str(raw).replace(",", "").replace("฿", "").strip())
+
+@st.cache_data(ttl=300, show_spinner="กำลังโหลดสาขาและเมนูจาก Google Sheet ...")
+def load_config():
+    """Returns (branch_config {vid: branch}, master_data {branch: {code: item}}, warnings)."""
+    spreadsheet = get_spreadsheet()
+    branch_ws = get_or_create_tab(spreadsheet, BRANCH_TAB, BRANCH_HEADER,
+                                  [[vid, name] for vid, name in SEED_BRANCHES.items()])
+    menu_ws = get_or_create_tab(spreadsheet, MENU_TAB, MENU_HEADER, seed_menu_rows())
+
+    warnings = []
+    branch_config = {}
+    for i, row in enumerate(branch_ws.get_all_values()[1:], start=2):
+        vid, name = [(row[j].strip() if j < len(row) else "") for j in range(2)]
+        if not vid and not name:
+            continue
+        if not vid or not name:
+            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: ต้องมีทั้ง VID และชื่อสาขา — ข้ามแถวนี้")
+        elif vid in branch_config:
+            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: VID {vid} ซ้ำ — ใช้แถวแรกที่เจอ")
+        else:
+            branch_config[vid] = name
+
+    known_branches = set(branch_config.values())
+    master_data = {name: {} for name in known_branches}
+    for i, row in enumerate(menu_ws.get_all_values()[1:], start=2):
+        branch, code, name, price = [(row[j].strip() if j < len(row) else "") for j in range(4)]
+        if not any([branch, code, name, price]):
+            continue
+        if branch not in known_branches:
+            warnings.append(f"แท็บ {MENU_TAB} แถว {i}: ไม่มีสาขา \"{branch}\" ในแท็บ {BRANCH_TAB} — ข้ามแถวนี้")
+            continue
+        if not code:
+            warnings.append(f"แท็บ {MENU_TAB} แถว {i}: ไม่มีรหัสสินค้า — ข้ามแถวนี้")
+            continue
+        try:
+            price_value = parse_price(price)
+        except ValueError:
+            warnings.append(f"แท็บ {MENU_TAB} แถว {i}: ราคา \"{price}\" ไม่ใช่ตัวเลข — ข้ามแถวนี้")
+            continue
+        if code in master_data[branch]:
+            warnings.append(f"แท็บ {MENU_TAB} แถว {i}: รหัส {code} ซ้ำในสาขา {branch} — ใช้แถวแรกที่เจอ")
+            continue
+        master_data[branch][code] = {"code": code, "name": name, "price": price_value}
+
+    return branch_config, master_data, warnings
 
 @st.cache_resource
 def get_vision_semaphore():
@@ -80,12 +158,12 @@ def clean_for_sheets(value):
     return value
 
 # --- AI ---
-def analyze_receipts(images, model_version):
+def analyze_receipts(images, model_version, valid_vids):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     preferred_model = 'gemini-2.5-flash' if model_version == "Flash (เน้นแม่นยำ)" else 'gemini-2.5-flash-lite'
     fallback_model = 'gemini-2.5-flash-lite' if preferred_model == 'gemini-2.5-flash' else 'gemini-2.5-flash'
     prompt = f"""
-    Find VID number in the receipt header. Valid VIDs: {list(BRANCH_CONFIG.keys())}
+    Find VID number in the receipt header. Valid VIDs: {valid_vids}
     Extract for each item line where Total_Amount > 0.
 
     The receipt lines ALWAYS follow this exact structure in 2 rows:
@@ -448,11 +526,10 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 try:
-    with open('item_master.json', 'r', encoding='utf-8') as f:
-        master_data = json.load(f)
-except Exception:
-    st.error("ไม่พบไฟล์ item_master.json")
-    master_data = {}
+    BRANCH_CONFIG, master_data, config_warnings = load_config()
+except Exception as e:
+    st.error(f"โหลดสาขาและเมนูจาก Google Sheet ไม่ได้: {e}")
+    st.stop()
 
 # ── Step 1: Settings ─────────────────────────────────────────
 st.markdown("""
@@ -505,7 +582,7 @@ if st.button("🔍  สแกนและตรวจสอบข้อมูล
                 for f in files:
                     img_bytes = f.read()
                     img_part = {"mime_type": f.type or "image/jpeg", "data": img_bytes}
-                    results = analyze_receipts([img_part], ai_choice)
+                    results = analyze_receipts([img_part], ai_choice, list(BRANCH_CONFIG.keys()))
                     ai_results.extend(results)
                     del img_bytes, img_part
                     gc.collect()
@@ -753,3 +830,28 @@ with st.expander("🗑️  แก้ไขข้อมูลที่อัป�
                 st.session_state.pop('delete_date_str', None)
                 st.session_state.pop('delete_branch', None)
                 st.rerun()
+
+# ── Section 5: Branch & menu settings ───────────────────────
+if config_warnings:
+    st.warning(f"พบปัญหา {len(config_warnings)} จุดในแท็บตั้งค่าสาขา/เมนู — ดูรายละเอียดในหัวข้อ \"สาขาและเมนู\" ด้านล่าง")
+
+with st.expander("⚙️  สาขาและเมนู — แก้ไขได้ใน Google Sheet"):
+    st.markdown(f"""
+    <div style='color:#6B7280;font-size:13px;margin-bottom:12px;'>
+    เพิ่ม/แก้สาขาที่แท็บ <strong>{BRANCH_TAB}</strong> และเมนูที่แท็บ <strong>{MENU_TAB}</strong>
+    ชื่อสาขาในสองแท็บต้องสะกดตรงกันทุกตัวอักษร · แอปดึงข้อมูลใหม่ทุก 5 นาที หรือกดปุ่มด้านล่างเพื่อโหลดทันที
+    </div>
+    """, unsafe_allow_html=True)
+
+    df_branches = pd.DataFrame(
+        [{"VID": vid, "สาขา": name, "จำนวนเมนู": len(master_data.get(name, {}))}
+         for vid, name in BRANCH_CONFIG.items()]
+    )
+    st.dataframe(df_branches, use_container_width=True, hide_index=True)
+
+    for w in config_warnings:
+        st.warning(w)
+
+    if st.button("🔄  โหลดสาขาและเมนูใหม่จากชีท", key="reload_config"):
+        load_config.clear()
+        st.rerun()
