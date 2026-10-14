@@ -70,7 +70,9 @@ def seed_menu_rows():
             for item in branch_items.values()]
 
 def normalize_id(raw):
-    return re.sub(r"\s+", "", str(raw)).upper()
+    value = re.sub(r"\s+", "", str(raw)).upper()
+    # Sheets drops leading zeros from numbers typed into a cell, so 000020 and 20 must match.
+    return (value.lstrip("0") or "0") if value.isdigit() else value
 
 def parse_price(raw):
     return float(str(raw).replace(",", "").replace("฿", "").strip())
@@ -171,20 +173,34 @@ def analyze_receipts(images, model_version, branch_ids):
     preferred_model = 'gemini-2.5-flash' if model_version == "Flash (เน้นแม่นยำ)" else 'gemini-2.5-flash-lite'
     fallback_model = 'gemini-2.5-flash-lite' if preferred_model == 'gemini-2.5-flash' else 'gemini-2.5-flash'
     prompt = f"""
-    Identify which branch this receipt belongs to. The receipt header prints exactly one of
-    these branch identifiers (the label shown is the text printed next to it, if known):
+    This document is a sales receipt or sales report (photo or PDF). Identify which branch each
+    item belongs to. The document prints one of these branch identifiers (the label shown is the
+    text printed next to it, if known):
 {branch_ids}
-    Put that identifier, copied exactly as listed above, in the "vid" field.
-    Extract for each item line where Total_Amount > 0.
+    Put that identifier, copied exactly as listed above, in the "vid" field of every item.
+    A report may contain several store sections, each with its own identifier — use the
+    identifier of the section the item is listed under.
 
-    The receipt lines ALWAYS follow this exact structure in 2 rows:
+    Extract every item line whose total amount is > 0. Skip subtotal and grand-total rows
+    (e.g. "ยอดรวมตามร้านค้า", "ยอดรวมทั้งสิ้น").
+
+    The document uses one of these layouts:
+
+    Layout A — 2 rows per item:
     Row 1: [Line Number]. [Item Name]
     Row 2: [Item Code]   [Unit Price]   [Quantity]   [Total Amount]
-
     Example:
     2. ข้าวมันไก่ทอด
     FMFC033-002  60  33 1,980.00
     → code: "FMFC033-002", unit_price: 60.0, qty: 33, total_amount: 1980.0
+
+    Layout B — 1 row per item, columns:
+    [Item Code] [Item Name] [Quantity] [Total incl. VAT "ยอดขายรวมทั้งสิ้น"] [VAT] [Before VAT "ก่อน VAT"]
+    There is no unit price column: total_amount is the "ยอดขายรวมทั้งสิ้น" column (incl. VAT),
+    never the VAT or before-VAT column, and unit_price = total_amount / qty.
+    Example:
+    JL2002  ข้าวขาหมู  17  1,190.00  77.85  1,112.15
+    → code: "JL2002", unit_price: 70.0, qty: 17, total_amount: 1190.0
 
     Return ONLY JSON list: [{{"vid": "str", "code": "str", "unit_price": float, "qty": int, "total_amount": float}}]
     """
@@ -584,7 +600,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-files = st.file_uploader("ถ่ายรูปสลิปสาขา", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+files = st.file_uploader("ถ่ายรูปสลิป / ไฟล์ PDF รายงานยอดขาย", type=['jpg', 'jpeg', 'png', 'pdf'], accept_multiple_files=True)
 csv_file = st.file_uploader("อัปโหลดไฟล์ CSV (เอสพลานาด)", type=['csv'])
 
 st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
