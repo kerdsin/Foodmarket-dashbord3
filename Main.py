@@ -31,6 +31,35 @@ SEED_BRANCHES = {
 }
 SEED_MENU_FILE = "item_master.json"
 
+# Stores added to the sheet automatically if their slip code is not in the branch tab yet.
+# Once a store is in the sheet, the sheet is the source of truth and is never overwritten.
+DEFAULT_STORES = [
+    {
+        "slip_id": "000020",
+        "name": "หมูพริ้ว เยาวราช",
+        "label": "ร้านค้า",
+        "menu": [
+            ("JL2001", "ข้าวขาหมูมหาชน (อิ่มพอดี)", 50),
+            ("JL2002", "ข้าวขาหมู", 70),
+            ("JL2003", "ข้าวกะเพราขาหมู", 70),
+            ("JL2004", "ข้าวขาหมูลีน", 80),
+            ("JL2005", "ข้าวขาหมูรวมพล (เนื้อ คากิ ไส้ ไข่)", 90),
+            ("JL2006", "ขาหมูรวมพล (เนื้อ คากิ ไส้ ไข่)", 160),
+            ("JL2007", "ข้าวหมูทอด", 65),
+            ("JL2008", "ข้าวหมู2สหาย", 80),
+            ("JL2009", "ข้าวหมูทอดพริกเกลือ", 65),
+            ("JL2010", "เพิ่ม ข้าวเปล่า", 10),
+            ("JL2011", "เพิ่ม ไส้พะโล้", 15),
+            ("JL2012", "เพิ่ม ไข่พะโล้", 10),
+            ("JL2013", "เพิ่ม พิเศษ", 10),
+            ("JL2014", "เพิ่มหมูทอด", 15),
+            ("JL2015", "เพิ่มกานาฉ่าย", 10),
+            ("JL2016", "น้ำเปล่า", 10),
+            ("JL2017", "ใส่กล่อง", 5),
+        ],
+    },
+]
+
 CSV_CONFIG = {
     "date_col": "วันที่เปิดบิล",
     "item_col": "ชื่อเมนู",
@@ -79,6 +108,20 @@ def normalize_id(raw):
 def parse_price(raw):
     return float(str(raw).replace(",", "").replace("฿", "").strip())
 
+def add_default_stores(branch_ws, menu_ws):
+    """Appends any DEFAULT_STORES missing from the branch tab. Returns the names added."""
+    added = []
+    with get_seed_lock():
+        existing = {normalize_id(r[0]) for r in branch_ws.get_all_values()[1:] if r and r[0].strip()}
+        for store in DEFAULT_STORES:
+            if normalize_id(store["slip_id"]) in existing:
+                continue
+            menu_ws.append_rows([[store["name"], code, name, price] for code, name, price in store["menu"]],
+                                value_input_option="RAW")
+            branch_ws.append_rows([[store["slip_id"], store["name"], store["label"]]], value_input_option="RAW")
+            added.append(store["name"])
+    return added
+
 @st.cache_data(ttl=300, show_spinner="กำลังโหลดสาขาและเมนูจาก Google Sheet ...")
 def load_config():
     """Returns (branch_config {slip_id: branch}, branch_labels {slip_id: label}, master_data {branch: {code: item}}, warnings)."""
@@ -88,6 +131,10 @@ def load_config():
     menu_ws = get_or_create_tab(spreadsheet, MENU_TAB, MENU_HEADER, seed_menu_rows())
 
     warnings = []
+    try:
+        add_default_stores(branch_ws, menu_ws)
+    except Exception as e:
+        warnings.append(f"เพิ่มร้านเริ่มต้นลงแท็บ {BRANCH_TAB}/{MENU_TAB} ไม่ได้: {e}")
     branch_config = {}
     branch_labels = {}
     seen_ids = set()
