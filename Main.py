@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import math
+import re
 import hmac
 import threading
 import time
@@ -15,7 +16,7 @@ import datetime
 # --- CONFIG ---
 BRANCH_TAB = "ตั้งค่า_สาขา"
 MENU_TAB = "ตั้งค่า_เมนู"
-BRANCH_HEADER = ["VID", "สาขา"]
+BRANCH_HEADER = ["รหัสบนสลิป", "สาขา", "ป้ายบนสลิป (ถ้ามี)"]
 MENU_HEADER = ["สาขา", "รหัสสินค้า", "ชื่อเมนู", "ราคา"]
 
 # Only used to fill the two config tabs the first time they are created.
@@ -68,29 +69,36 @@ def seed_menu_rows():
             for branch, branch_items in items.items()
             for item in branch_items.values()]
 
+def normalize_id(raw):
+    return re.sub(r"\s+", "", str(raw)).upper()
+
 def parse_price(raw):
     return float(str(raw).replace(",", "").replace("฿", "").strip())
 
 @st.cache_data(ttl=300, show_spinner="กำลังโหลดสาขาและเมนูจาก Google Sheet ...")
 def load_config():
-    """Returns (branch_config {vid: branch}, master_data {branch: {code: item}}, warnings)."""
+    """Returns (branch_config {slip_id: branch}, branch_labels {slip_id: label}, master_data {branch: {code: item}}, warnings)."""
     spreadsheet = get_spreadsheet()
     branch_ws = get_or_create_tab(spreadsheet, BRANCH_TAB, BRANCH_HEADER,
-                                  [[vid, name] for vid, name in SEED_BRANCHES.items()])
+                                  [[vid, name, "VID"] for vid, name in SEED_BRANCHES.items()])
     menu_ws = get_or_create_tab(spreadsheet, MENU_TAB, MENU_HEADER, seed_menu_rows())
 
     warnings = []
     branch_config = {}
+    branch_labels = {}
+    seen_ids = set()
     for i, row in enumerate(branch_ws.get_all_values()[1:], start=2):
-        vid, name = [(row[j].strip() if j < len(row) else "") for j in range(2)]
-        if not vid and not name:
+        slip_id, name, label = [(row[j].strip() if j < len(row) else "") for j in range(3)]
+        if not slip_id and not name:
             continue
-        if not vid or not name:
-            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: ต้องมีทั้ง VID และชื่อสาขา — ข้ามแถวนี้")
-        elif vid in branch_config:
-            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: VID {vid} ซ้ำ — ใช้แถวแรกที่เจอ")
+        if not slip_id or not name:
+            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: ต้องมีทั้งรหัสบนสลิปและชื่อสาขา — ข้ามแถวนี้")
+        elif normalize_id(slip_id) in seen_ids:
+            warnings.append(f"แท็บ {BRANCH_TAB} แถว {i}: รหัส {slip_id} ซ้ำ — ใช้แถวแรกที่เจอ")
         else:
-            branch_config[vid] = name
+            seen_ids.add(normalize_id(slip_id))
+            branch_config[slip_id] = name
+            branch_labels[slip_id] = label
 
     known_branches = set(branch_config.values())
     master_data = {name: {} for name in known_branches}
@@ -114,7 +122,7 @@ def load_config():
             continue
         master_data[branch][code] = {"code": code, "name": name, "price": price_value}
 
-    return branch_config, master_data, warnings
+    return branch_config, branch_labels, master_data, warnings
 
 @st.cache_resource
 def get_vision_semaphore():
@@ -158,12 +166,15 @@ def clean_for_sheets(value):
     return value
 
 # --- AI ---
-def analyze_receipts(images, model_version, valid_vids):
+def analyze_receipts(images, model_version, branch_ids):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     preferred_model = 'gemini-2.5-flash' if model_version == "Flash (เน้นแม่นยำ)" else 'gemini-2.5-flash-lite'
     fallback_model = 'gemini-2.5-flash-lite' if preferred_model == 'gemini-2.5-flash' else 'gemini-2.5-flash'
     prompt = f"""
-    Find VID number in the receipt header. Valid VIDs: {valid_vids}
+    Identify which branch this receipt belongs to. The receipt header prints exactly one of
+    these branch identifiers (the label shown is the text printed next to it, if known):
+{branch_ids}
+    Put that identifier, copied exactly as listed above, in the "vid" field.
     Extract for each item line where Total_Amount > 0.
 
     The receipt lines ALWAYS follow this exact structure in 2 rows:
@@ -526,10 +537,16 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 try:
-    BRANCH_CONFIG, master_data, config_warnings = load_config()
+    BRANCH_CONFIG, branch_labels, master_data, config_warnings = load_config()
 except Exception as e:
     st.error(f"โหลดสาขาและเมนูจาก Google Sheet ไม่ได้: {e}")
     st.stop()
+
+branch_by_id = {normalize_id(slip_id): name for slip_id, name in BRANCH_CONFIG.items()}
+branch_id_prompt = "\n".join(
+    f'    - "{slip_id}"' + (f' (labeled "{branch_labels[slip_id]}")' if branch_labels[slip_id] else "")
+    for slip_id in BRANCH_CONFIG
+)
 
 # ── Step 1: Settings ─────────────────────────────────────────
 st.markdown("""
@@ -582,13 +599,13 @@ if st.button("🔍  สแกนและตรวจสอบข้อมูล
                 for f in files:
                     img_bytes = f.read()
                     img_part = {"mime_type": f.type or "image/jpeg", "data": img_bytes}
-                    results = analyze_receipts([img_part], ai_choice, list(BRANCH_CONFIG.keys()))
+                    results = analyze_receipts([img_part], ai_choice, branch_id_prompt)
                     ai_results.extend(results)
                     del img_bytes, img_part
                     gc.collect()
 
                 for d in ai_results:
-                    branch = BRANCH_CONFIG.get(d.get('vid'), "ไม่ทราบสาขา")
+                    branch = branch_by_id.get(normalize_id(d.get('vid', '')), "ไม่ทราบสาขา")
                     extracted_code = str(d.get('code', '')).strip()
                     ai_unit_price = float(d.get('unit_price', 0))
                     ai_qty = int(d.get('qty', 0))
@@ -844,8 +861,9 @@ with st.expander("⚙️  สาขาและเมนู — แก้ไข�
     """, unsafe_allow_html=True)
 
     df_branches = pd.DataFrame(
-        [{"VID": vid, "สาขา": name, "จำนวนเมนู": len(master_data.get(name, {}))}
-         for vid, name in BRANCH_CONFIG.items()]
+        [{"รหัสบนสลิป": slip_id, "ป้ายบนสลิป": branch_labels[slip_id], "สาขา": name,
+          "จำนวนเมนู": len(master_data.get(name, {}))}
+         for slip_id, name in BRANCH_CONFIG.items()]
     )
     st.dataframe(df_branches, use_container_width=True, hide_index=True)
 
