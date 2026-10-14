@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
+import io
 import math
 import re
 import hmac
@@ -8,6 +9,7 @@ import threading
 import time
 import gc
 import google.generativeai as genai
+import pdfplumber
 from google.api_core.exceptions import ResourceExhausted
 import gspread
 from google.oauth2.service_account import Credentials
@@ -228,6 +230,76 @@ def analyze_receipts(images, model_version, branch_ids):
                     time.sleep(2)
 
     raise ValueError(f"AI ไม่สามารถอ่านสลิปได้ ({last_error}) — ลองใหม่อีกครั้งในอีกสักครู่")
+
+
+# --- PDF sales report (text-based, no AI) ---
+ITEM_CODE_RE = re.compile(r"^[A-Z][A-Z0-9-]*\d[A-Z0-9-]*$")
+AMOUNT_RE = re.compile(r"^-?[\d,]+(\.\d+)?$")
+DATE_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+def pdf_rows(pdf):
+    """Yields each visual line of the PDF as a list of words, left to right."""
+    for page in pdf.pages:
+        row, row_top = [], None
+        for w in sorted(page.extract_words(), key=lambda w: (w["top"], w["x0"])):
+            if row and w["top"] - row_top > 3:
+                yield [x["text"] for x in sorted(row, key=lambda x: x["x0"])]
+                row = []
+            if not row:
+                row_top = w["top"]
+            row.append(w)
+        if row:
+            yield [x["text"] for x in sorted(row, key=lambda x: x["x0"])]
+
+def to_amount(token):
+    return float(token.replace(",", ""))
+
+def parse_sales_report_pdf(data):
+    """Parses the "รายงานสรุปยอดขาย Item สินค้า แยกตามร้านค้า" PDF.
+
+    Returns (items, report_date) or None when the file is not that report or any store
+    section's items don't add up to its printed subtotal — the caller then falls back to AI.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            rows = list(pdf_rows(pdf))
+    except Exception:
+        return None
+
+    items, section, store, report_date = [], [], None, None
+    for row in rows:
+        dates = [t for t in row if DATE_RE.match(t)]
+        if report_date is None and len(dates) == 2 and not any(TIME_RE.match(t) for t in row):
+            d1, d2 = (datetime.date(int(y), int(m), int(d)) for d, m, y in (DATE_RE.match(t).groups() for t in dates))
+            report_date = d1 if d1 == d2 else (d1, d2)
+
+        if row[0] == "ร้านค้า" and len(row) > 1:
+            if section:
+                return None  # previous store had no subtotal row to check against
+            store = row[1]
+            continue
+
+        tail = row[-4:]
+        numeric_tail = len(row) >= 5 and all(AMOUNT_RE.match(t) for t in tail)
+
+        if store and ITEM_CODE_RE.match(row[0]) and numeric_tail:
+            qty, total, vat, before_vat = (to_amount(t) for t in tail)
+            if qty <= 0 or qty != int(qty) or abs(total - vat - before_vat) > 0.02:
+                return None
+            section.append({"vid": store, "code": row[0], "qty": int(qty),
+                            "total_amount": total, "unit_price": total / qty})
+        elif row[0].startswith("ยอดรวมตามร้านค้า") and len(row) >= 5 and numeric_tail:
+            qty_sum, total_sum = to_amount(tail[0]), to_amount(tail[1])
+            if (not section or qty_sum != sum(i["qty"] for i in section)
+                    or abs(total_sum - sum(i["total_amount"] for i in section)) > 0.01):
+                return None
+            items.extend(section)
+            section, store = [], None
+
+    if section or not items:
+        return None
+    return items, report_date
 
 # ============================================================
 # PAGE CONFIG & STYLES
@@ -608,16 +680,30 @@ st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 if st.button("🔍  สแกนและตรวจสอบข้อมูล", type="primary", use_container_width=True):
     temp_data = []
 
+    read_notes = []
     if files:
         with st.spinner(f"กำลังสแกนด้วย {ai_choice} ..."):
             try:
                 ai_results = []
                 for f in files:
                     img_bytes = f.read()
-                    img_part = {"mime_type": f.type or "image/jpeg", "data": img_bytes}
-                    results = analyze_receipts([img_part], ai_choice, branch_id_prompt)
+                    is_pdf = f.type == "application/pdf" or f.name.lower().endswith(".pdf")
+                    parsed = parse_sales_report_pdf(img_bytes) if is_pdf else None
+                    if parsed:
+                        results, report_date = parsed
+                        read_notes.append(("info", f"📄 {f.name}: อ่านจากข้อความใน PDF โดยตรง ไม่ใช้ AI — {len(results)} รายการ ยอดตรงกับยอดรวมในรายงาน"))
+                        if isinstance(report_date, tuple):
+                            read_notes.append(("warning", f"{f.name}: รายงานนี้ครอบคลุมหลายวัน ({report_date[0].strftime('%d/%m/%Y')}–{report_date[1].strftime('%d/%m/%Y')}) แต่จะถูกบันทึกเป็นวันที่ {selected_date.strftime('%d/%m/%Y')} ทั้งหมด"))
+                        elif report_date and report_date != selected_date:
+                            read_notes.append(("warning", f"{f.name}: รายงานเป็นยอดของวันที่ {report_date.strftime('%d/%m/%Y')} แต่เลือกวันที่ไว้ {selected_date.strftime('%d/%m/%Y')} — ตรวจวันที่ก่อนบันทึก"))
+                    else:
+                        if is_pdf:
+                            read_notes.append(("info", f"🤖 {f.name}: อ่านข้อความใน PDF ไม่ได้หรือไม่ใช่รูปแบบรายงานที่รู้จัก — ใช้ AI อ่านแทน"))
+                        img_part = {"mime_type": f.type or "image/jpeg", "data": img_bytes}
+                        results = analyze_receipts([img_part], ai_choice, branch_id_prompt)
+                        del img_part
                     ai_results.extend(results)
-                    del img_bytes, img_part
+                    del img_bytes
                     gc.collect()
 
                 for d in ai_results:
@@ -727,6 +813,8 @@ if st.button("🔍  สแกนและตรวจสอบข้อมูล
         st.success(f"สแกนสำเร็จ — พบ {len(temp_data)} รายการ ของวันที่ {selected_date.strftime('%d/%m/%Y')}")
     elif csv_file or files:
         st.warning(f"ไม่พบข้อมูลของวันที่ {selected_date.strftime('%d/%m/%Y')}")
+    for level, note in read_notes:
+        (st.warning if level == "warning" else st.info)(note)
 
 # ── Step 3: Review & Save ────────────────────────────────────
 if 'preview_data' in st.session_state and st.session_state['preview_data']:
