@@ -36,7 +36,7 @@ SEED_MENU_FILE = "item_master.json"
 DEFAULT_STORES = [
     {
         "slip_id": "000020",
-        "name": "หมูพริ้ว เยาวราช",
+        "name": "JLK หมูพริ้ว",
         "label": "ร้านค้า",
         "menu": [
             ("JL2001", "ข้าวขาหมูมหาชน (อิ่มพอดี)", 50),
