@@ -31,6 +31,9 @@ SEED_BRANCHES = {
 }
 SEED_MENU_FILE = "item_master.json"
 
+# Names this code used earlier for a default store; a sheet row with exactly one of these is renamed once.
+LEGACY_STORE_NAMES = {"000020": ["หมูพริ้ว เยาวราช"]}
+
 # Stores added to the sheet automatically if their slip code is not in the branch tab yet.
 # Once a store is in the sheet, the sheet is the source of truth and is never overwritten.
 DEFAULT_STORES = [
@@ -108,13 +111,30 @@ def normalize_id(raw):
 def parse_price(raw):
     return float(str(raw).replace(",", "").replace("฿", "").strip())
 
+def rename_legacy_store(store, branch_ws, menu_ws, branch_rows):
+    """Renames a default store the sheet still holds under an old default name (menu rows first, then the branch)."""
+    legacy = LEGACY_STORE_NAMES.get(store["slip_id"], [])
+    branch_row = next((i for i, r in enumerate(branch_rows, start=1) if i > 1 and r and len(r) > 1
+                       and normalize_id(r[0]) == normalize_id(store["slip_id"]) and r[1].strip() in legacy), None)
+    if branch_row is None:
+        return
+    old_name = branch_rows[branch_row - 1][1].strip()
+    menu_cells = [gspread.Cell(i, 1, store["name"])
+                  for i, r in enumerate(menu_ws.get_all_values(), start=1)
+                  if i > 1 and r and r[0].strip() == old_name]
+    if menu_cells:
+        menu_ws.update_cells(menu_cells, value_input_option="RAW")
+    branch_ws.update_cell(branch_row, 2, store["name"])
+
 def add_default_stores(branch_ws, menu_ws):
     """Appends any DEFAULT_STORES missing from the branch tab. Returns the names added."""
     added = []
     with get_seed_lock():
-        existing = {normalize_id(r[0]) for r in branch_ws.get_all_values()[1:] if r and r[0].strip()}
+        branch_rows = branch_ws.get_all_values()
+        existing = {normalize_id(r[0]) for r in branch_rows[1:] if r and r[0].strip()}
         for store in DEFAULT_STORES:
             if normalize_id(store["slip_id"]) in existing:
+                rename_legacy_store(store, branch_ws, menu_ws, branch_rows)
                 continue
             menu_ws.append_rows([[store["name"], code, name, price] for code, name, price in store["menu"]],
                                 value_input_option="RAW")
